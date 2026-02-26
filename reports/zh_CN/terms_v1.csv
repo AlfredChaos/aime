@@ -1,0 +1,19 @@
+Term,Chinese,PlainExplanation,Notes
+ReAct,先想后做,"一种智能体工作方式，先用模型推理，再调用工具执行。",核心范式
+MCP,模型上下文协议,"一种标准协议，让智能体安全调用外部工具/服务。",支持HTTP/StdIO
+Msg,消息,"AgentScope统一的消息对象，用于输入输出与存储。",包含name/role/content
+Tool,工具,"可调用的Python对象，智能体用它完成实际动作。",函数/方法/可调用实例
+Toolkit,工具箱,"工具的注册与管理容器，提供JSON Schema等。",支持分组和移除
+Prompt Formatter,提示词格式化器,"把消息对象转换成各模型API需要的输入格式。",包含多实体格式
+Memory,记忆,"存储与检索消息历史的模块，支持标记过滤。",InMemory/SQL/Redis
+Long-Term Memory,长期记忆,"跨会话持久化的个人或全局记忆，支持检索。",Mem0/ReMe
+Compression,记忆压缩,"在Token过多时生成摘要，保留关键信息。",标记而不替换原消息
+Structured Output,结构化输出,"用Pydantic约束返回数据结构，减少幻觉。",metadata返回
+Token Counter,Token计数,"评估上下文长度，触发压缩或截断策略。",Char/Model级
+A2A,Agent-to-Agent,"智能体间通信协议，用于分布式协作。",注册与发现
+MsgHub,消息中心,"用于多智能体广播与编排的消息总线。",多智能体工作流
+OpenTelemetry,开放遥测,"统一追踪与可观测性标准。",内置OTel集成
+AgentScope Studio,可视化工作台,"本地开发调试与可观测性GUI。",项目/运行/追踪
+RAG,检索增强生成,"结合知识库检索与生成提升准确性。",向量检索
+TTS,文本转语音,"把文本生成语音的能力。",实时语音Agent
+Tuner,微调,"训练或校准模型以适应特定任务。",内置支持
