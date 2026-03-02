@@ -16,7 +16,7 @@ from agentscope.formatter import GeminiChatFormatter
 from agentscope.memory import InMemoryMemory, Mem0LongTermMemory
 from agentscope.message import Msg
 from agentscope.model import GeminiChatModel
-from agentscope.tool import Toolkit, execute_python_code
+from agent_bootstrap import create_toolkit
 
 # Load environment variables from .env file
 load_dotenv()
@@ -225,10 +225,7 @@ async def creating_react_agent() -> None:
     )
 
     # Prepare tools
-    toolkit = Toolkit()
-    toolkit.register_tool_function(execute_python_code)
-    for fn in _discover_tool_functions(tools_dir):
-        toolkit.register_tool_function(fn)
+    toolkit = create_toolkit(project_root=str(project_root))
 
     aime = ReActAgent(
         name="Aime",

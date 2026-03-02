@@ -66,7 +66,8 @@ def count_words(text: str) -> ToolResponse:
     Count words in the given text.
 
     Args:
-        text: Any text.
+        text (str):
+            Any text.
     """
     words = re.findall(r"\b\w+\b", text)
     return ToolResponse(content=[TextBlock(text=str(len(words)))])
@@ -77,8 +78,10 @@ def extract_top_lines(text: str, max_lines: int = 5) -> ToolResponse:
     Extract the first N non-empty lines.
 
     Args:
-        text: Any text with line breaks.
-        max_lines: Maximum number of non-empty lines to return.
+        text (str):
+            Any text with line breaks.
+        max_lines (int):
+            Maximum number of non-empty lines to return.
     """
     if max_lines <= 0:
         raise ValueError("max_lines must be positive")
@@ -87,15 +90,36 @@ def extract_top_lines(text: str, max_lines: int = 5) -> ToolResponse:
 
 
 def list_skills() -> ToolResponse:
+    """
+    列出 skills/ 目录下所有可用技能（只返回索引，不返回全文内容）。
+    """
     skills = _get_skills_index()
     return ToolResponse(content=[TextBlock(text=json.dumps(skills, ensure_ascii=False, indent=2))])
 
 
 def read_skill_markdown(skill_dir: str) -> ToolResponse:
+    """
+    读取指定技能目录下的 SKILL.md 全文。
+
+    Args:
+        skill_dir (str):
+            skills/ 下的子目录名（不是 YAML front matter 里的 name 字段）。
+    """
     return read_skill_file(skill_dir=skill_dir, relative_path="SKILL.md")
 
 
 def read_skill_file(skill_dir: str, relative_path: str, max_chars: int = 12000) -> ToolResponse:
+    """
+    读取指定技能目录下的任意文件（用于按需披露技能细节）。
+
+    Args:
+        skill_dir (str):
+            skills/ 下的子目录名。
+        relative_path (str):
+            相对 skill 目录的路径（例如 \"prompt.txt\" 或 \"scripts/example.py\"）。
+        max_chars (int):
+            读取内容的最大字符数，超出将截断。
+    """
     if max_chars <= 0:
         raise ValueError("max_chars must be positive")
 

@@ -79,10 +79,29 @@ def discover_and_register_tools(toolkit: Toolkit, tools_dir: str) -> list[str]:
             raise TypeError(
                 f"{file_path} TOOL_FUNCTIONS must be a list/tuple of callables",
             )
-        for fn in tool_functions:
-            if not callable(fn):
-                raise TypeError(f"{file_path} TOOL_FUNCTIONS contains non-callable")
-            toolkit.register_tool_function(fn)
+
+        for item in tool_functions:
+            if callable(item):
+                toolkit.register_tool_function(item)
+                continue
+
+            if isinstance(item, tuple) and len(item) == 2 and callable(item[0]) and isinstance(item[1], dict):
+                toolkit.register_tool_function(item[0], preset_kwargs=item[1])
+                continue
+
+            if isinstance(item, dict):
+                fn = item.get("fn") or item.get("function")
+                preset_kwargs = item.get("preset_kwargs")
+                if not callable(fn):
+                    raise TypeError(f"{file_path} TOOL_FUNCTIONS dict item missing callable fn")
+                if preset_kwargs is not None and not isinstance(preset_kwargs, dict):
+                    raise TypeError(f"{file_path} TOOL_FUNCTIONS dict item preset_kwargs must be dict")
+                toolkit.register_tool_function(fn, preset_kwargs=preset_kwargs)
+                continue
+
+            raise TypeError(
+                f"{file_path} TOOL_FUNCTIONS item must be callable, (callable, dict), or dict",
+            )
         loaded.append(str(file_path))
 
     return loaded
@@ -195,16 +214,24 @@ def create_skill_reader_tools(skills_dir: str) -> list[Callable]:
 
 def create_toolkit(project_root: str | None = None) -> Toolkit:
     root = Path(project_root or os.getcwd()).resolve()
-    tools_dir = str(root / "tools")
-    skills_dir = str(root / "skills")
+    tools_dir = str(Path(os.environ.get("TOOLS_DIR", root / "tools")).expanduser())
+    skills_dir = str(Path(os.environ.get("SKILLS_DIR", root / "skills")).expanduser())
 
     toolkit = Toolkit()
 
-    for tool_fn in create_skill_reader_tools(skills_dir):
-        toolkit.register_tool_function(tool_fn)
+    tool_mod = __import__("agentscope.tool", fromlist=["*"])
+    for builtin_name in [
+        "execute_python_code",
+        "execute_shell_command",
+        "view_text_file",
+        "write_text_file",
+        "insert_text_file",
+    ]:
+        builtin = getattr(tool_mod, builtin_name, None)
+        if callable(builtin):
+            toolkit.register_tool_function(builtin)
 
     discover_and_register_tools(toolkit, tools_dir)
     discover_and_register_skills(toolkit, skills_dir)
 
     return toolkit
-
