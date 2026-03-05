@@ -3,10 +3,8 @@ import asyncio
 import os
 import uuid
 from pathlib import Path
-from typing import Callable, Iterable
 
 import fix_agentscope_gemini, fix_gemini_thinking_formatter
-import importlib.util
 from langfuse import Langfuse, observe
 from dotenv import load_dotenv
 
@@ -31,96 +29,6 @@ langfuse = Langfuse()
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parent
-
-
-def _parse_skill_front_matter(skill_md: Path) -> dict[str, str]:
-    try:
-        content = skill_md.read_text(encoding="utf-8")
-    except Exception:
-        return {}
-
-    lines = content.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return {}
-
-    parsed: dict[str, str] = {}
-    for line in lines[1:80]:
-        if line.strip() == "---":
-            break
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        key = key.strip()
-        value = value.strip()
-        if key and value:
-            parsed[key] = value
-    return parsed
-
-
-def _load_skills_index(skills_dir: Path) -> list[dict[str, str]]:
-    if not skills_dir.exists() or not skills_dir.is_dir():
-        return []
-
-    items: list[dict[str, str]] = []
-    for child in sorted(skills_dir.iterdir(), key=lambda p: p.name):
-        if not child.is_dir():
-            continue
-        skill_md = child / "SKILL.md"
-        if not skill_md.exists():
-            continue
-        fm = _parse_skill_front_matter(skill_md)
-        items.append(
-            {
-                "dir": child.name,
-                "name": fm.get("name", child.name),
-                "description": fm.get("description", ""),
-            },
-        )
-    return items
-
-
-def _discover_tool_functions(tools_dir: Path) -> list[Callable]:
-    if not tools_dir.exists() or not tools_dir.is_dir():
-        return []
-
-    tool_functions: list[Callable] = []
-    for path in sorted(tools_dir.glob("*.py"), key=lambda p: p.name):
-        if path.name.startswith("_"):
-            continue
-        module_name = f"global_tools.{path.stem}"
-        spec = importlib.util.spec_from_file_location(module_name, path)
-        if spec is None or spec.loader is None:
-            continue
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        funcs = getattr(module, "TOOL_FUNCTIONS", None)
-        if isinstance(funcs, Iterable):
-            for fn in funcs:
-                if callable(fn):
-                    tool_functions.append(fn)
-    return tool_functions
-
-
-def _build_sys_prompt(base_prompt: str, skills_index: list[dict[str, str]]) -> str:
-    if not skills_index:
-        return base_prompt
-
-    lines = []
-    for item in skills_index:
-        name = item.get("name") or item.get("dir") or ""
-        desc = (item.get("description") or "").strip()
-        if desc:
-            lines.append(f"- {name}: {desc}")
-        else:
-            lines.append(f"- {name}")
-
-    skills_section = "\n".join(lines)
-    return (
-        f"{base_prompt}\n\n"
-        f"可用 Skills（索引，按需读取细节）：\n{skills_section}\n\n"
-        "使用方式：先调用 list_skills() 获取索引；确认要用哪个 Skill 后，再调用 "
-        "read_skill_markdown(skill_dir) 或 read_skill_file(skill_dir, relative_path) 读取细节。"
-    )
 
 
 def _create_lancedb_vector_store(uri: str, table_name: str):
@@ -174,11 +82,6 @@ async def creating_react_agent() -> None:
         sys_prompt_content = "你是一个名为 Aime 的助手"
 
     project_root = _project_root()
-    tools_dir = Path(os.environ.get("TOOLS_DIR", project_root / "tools")).expanduser()
-    skills_dir = Path(os.environ.get("SKILLS_DIR", project_root / "skills")).expanduser()
-
-    skills_index = _load_skills_index(skills_dir)
-    sys_prompt_content = _build_sys_prompt(sys_prompt_content, skills_index)
 
     base_url = os.environ.get("GEMINI_BASE_URL", "https://aicode.cat")
     gemini_api_key = os.environ.get("GEMINI_API_KEY")

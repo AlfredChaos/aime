@@ -24,19 +24,10 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import os
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Iterable
 
-from agentscope.message import TextBlock
-from agentscope.tool import ToolResponse, Toolkit
-
-
-@dataclass(frozen=True)
-class SkillIndexItem:
-    name: str
-    description: str
-    directory: str
+from agentscope.tool import Toolkit
 
 
 def _iter_python_files(root_dir: Path) -> Iterable[Path]:
@@ -107,109 +98,20 @@ def discover_and_register_tools(toolkit: Toolkit, tools_dir: str) -> list[str]:
     return loaded
 
 
-def discover_and_register_skills(toolkit: Toolkit, skills_dir: str) -> list[SkillIndexItem]:
+def discover_and_register_skills(toolkit: Toolkit, skills_dir: str) -> list[str]:
     root = Path(skills_dir)
     if not root.exists():
         return []
 
-    items: list[SkillIndexItem] = []
+    registered: list[str] = []
     for skill_dir in sorted([p for p in root.iterdir() if p.is_dir()]):
         skill_md = skill_dir / "SKILL.md"
         if not skill_md.exists():
             continue
         toolkit.register_agent_skill(str(skill_dir))
+        registered.append(str(skill_dir))
 
-        try:
-            import frontmatter
-
-            skill_doc = frontmatter.load(skill_md)
-            name = str(skill_doc.metadata.get("name") or skill_dir.name)
-            description = str(skill_doc.metadata.get("description") or "").strip()
-        except Exception:
-            name = skill_dir.name
-            description = ""
-
-        items.append(
-            SkillIndexItem(
-                name=name,
-                description=description,
-                directory=str(skill_dir),
-            ),
-        )
-
-    return items
-
-
-def _safe_read_text(file_path: Path) -> str:
-    resolved = file_path.resolve()
-    return resolved.read_text(encoding="utf-8")
-
-
-def _resolve_skill_dir(skills_dir: Path, skill_name: str) -> Path:
-    candidate = (skills_dir / skill_name).resolve()
-    if not str(candidate).startswith(str(skills_dir.resolve()) + os.sep):
-        raise ValueError("Invalid skill path")
-    if not candidate.exists() or not candidate.is_dir():
-        raise FileNotFoundError(f"Skill not found: {skill_name}")
-    return candidate
-
-
-def create_skill_reader_tools(skills_dir: str) -> list[Callable]:
-    skills_root = Path(skills_dir).resolve()
-
-    def list_skills() -> ToolResponse:
-        """
-        列出 skills/ 目录下所有可用技能（只返回索引，不返回全文内容）。
-        """
-        items: list[dict] = []
-        for d in sorted([p for p in skills_root.iterdir() if p.is_dir()]):
-            skill_md = d / "SKILL.md"
-            if not skill_md.exists():
-                continue
-            name = d.name
-            description = ""
-            try:
-                import frontmatter
-
-                skill_doc = frontmatter.load(skill_md)
-                name = str(skill_doc.metadata.get("name") or name)
-                description = str(skill_doc.metadata.get("description") or "").strip()
-            except Exception:
-                pass
-            items.append({"skill": name, "description": description, "dir": str(d)})
-
-        return ToolResponse(content=[TextBlock(text=str(items))])
-
-    def read_skill_markdown(skill_name: str) -> ToolResponse:
-        """
-        读取指定技能目录下的 SKILL.md 全文。
-
-        Args:
-            skill_name: skills/ 下的子目录名（不是 YAML 里的 name 字段）。
-        """
-        skill_dir = _resolve_skill_dir(skills_root, skill_name)
-        skill_md = skill_dir / "SKILL.md"
-        if not skill_md.exists():
-            raise FileNotFoundError(f"SKILL.md not found in {skill_name}")
-        return ToolResponse(content=[TextBlock(text=_safe_read_text(skill_md))])
-
-    def read_skill_file(skill_name: str, relative_path: str) -> ToolResponse:
-        """
-        读取指定技能目录下的任意文件（用于按需披露技能细节）。
-
-        Args:
-            skill_name: skills/ 下的子目录名。
-            relative_path: 相对 skill 目录的路径（例如 "prompt.txt" 或 "scripts/example.py"）。
-        """
-        skill_dir = _resolve_skill_dir(skills_root, skill_name)
-        target = (skill_dir / relative_path).resolve()
-        if not str(target).startswith(str(skill_dir) + os.sep):
-            raise ValueError("Invalid relative_path")
-        if not target.exists() or not target.is_file():
-            raise FileNotFoundError(f"File not found: {relative_path}")
-        return ToolResponse(content=[TextBlock(text=_safe_read_text(target))])
-
-    return [list_skills, read_skill_markdown, read_skill_file]
+    return registered
 
 
 def create_toolkit(project_root: str | None = None) -> Toolkit:
