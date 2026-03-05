@@ -70,7 +70,7 @@ def count_words(text: str) -> ToolResponse:
             Any text.
     """
     words = re.findall(r"\b\w+\b", text)
-    return ToolResponse(content=[TextBlock(text=str(len(words)))])
+    return ToolResponse(content=[TextBlock(type="text", text=str(len(words)))])
 
 
 def extract_top_lines(text: str, max_lines: int = 5) -> ToolResponse:
@@ -86,7 +86,7 @@ def extract_top_lines(text: str, max_lines: int = 5) -> ToolResponse:
     if max_lines <= 0:
         raise ValueError("max_lines must be positive")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return ToolResponse(content=[TextBlock(text="\n".join(lines[:max_lines]))])
+    return ToolResponse(content=[TextBlock(type="text", text="\n".join(lines[:max_lines]))])
 
 
 def list_skills() -> ToolResponse:
@@ -94,7 +94,7 @@ def list_skills() -> ToolResponse:
     列出 skills/ 目录下所有可用技能（只返回索引，不返回全文内容）。
     """
     skills = _get_skills_index()
-    return ToolResponse(content=[TextBlock(text=json.dumps(skills, ensure_ascii=False, indent=2))])
+    return ToolResponse(content=[TextBlock(type="text", text=json.dumps(skills, ensure_ascii=False, indent=2))])
 
 
 def read_skill_markdown(skill_dir: str) -> ToolResponse:
@@ -138,7 +138,7 @@ def read_skill_file(skill_dir: str, relative_path: str, max_chars: int = 12000) 
     content = target.read_text(encoding="utf-8", errors="replace")
     if len(content) > max_chars:
         content = content[:max_chars]
-    return ToolResponse(content=[TextBlock(text=content)])
+    return ToolResponse(content=[TextBlock(type="text", text=content)])
 
 
 TOOL_FUNCTIONS = [count_words, extract_top_lines, list_skills, read_skill_markdown, read_skill_file]

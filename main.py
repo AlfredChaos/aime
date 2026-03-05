@@ -1,10 +1,19 @@
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    category=DeprecationWarning,
+    message=r"Inheritance class AiohttpClientSession from ClientSession is discouraged",
+)
 
 import asyncio
+import base64
+import mimetypes
 import os
 import uuid
 from pathlib import Path
 
-import fix_agentscope_gemini, fix_gemini_thinking_formatter
+import fix_gemini_thinking_formatter
 from langfuse import Langfuse, observe
 from dotenv import load_dotenv
 
@@ -12,15 +21,163 @@ from agentscope.agent import ReActAgent
 from agentscope.embedding import GeminiTextEmbedding
 from agentscope.formatter import GeminiChatFormatter
 from agentscope.memory import InMemoryMemory, Mem0LongTermMemory
-from agentscope.message import Msg
+from agentscope.message import Base64Source, ImageBlock, Msg, TextBlock
 from agentscope.model import GeminiChatModel
 from agent_bootstrap import create_toolkit
 
 # Load environment variables from .env file
 load_dotenv()
 
+def _patch_google_genai_client_close() -> None:
+    try:
+        from google.genai._api_client import BaseApiClient
+    except Exception:
+        return
+
+    if getattr(BaseApiClient.aclose, "_agentscope_research_patched", False):
+        return
+
+    original_close = BaseApiClient.close
+    original_aclose = BaseApiClient.aclose
+
+    def _safe_close(self) -> None:
+        if not hasattr(self, "_http_options"):
+            return
+        try:
+            return original_close(self)
+        except AttributeError as e:
+            if "_http_options" in str(e):
+                return
+            raise
+
+    async def _safe_aclose(self) -> None:
+        if not hasattr(self, "_http_options"):
+            return
+        try:
+            return await original_aclose(self)
+        except AttributeError as e:
+            if "_http_options" in str(e):
+                return
+            raise
+
+    _safe_close._agentscope_research_patched = True
+    _safe_aclose._agentscope_research_patched = True
+    BaseApiClient.close = _safe_close
+    BaseApiClient.aclose = _safe_aclose
+
+
+def _patch_agentscope_gemini_stream_usage() -> None:
+    from datetime import datetime
+    import json
+    import base64 as _base64
+
+    from agentscope.model import GeminiChatModel
+    from agentscope.model._model_usage import ChatUsage
+    from agentscope.message import ToolUseBlock, TextBlock, ThinkingBlock
+    from agentscope._utils._common import _json_loads_with_repair
+    from agentscope.model._model_response import ChatResponse
+
+    if getattr(
+        GeminiChatModel._parse_gemini_stream_generation_response,
+        "_agentscope_research_patched",
+        False,
+    ):
+        return
+
+    async def _patched_parse_gemini_stream_generation_response(
+        self,
+        start_datetime: datetime,
+        response,
+        structured_model=None,
+    ):
+        text = ""
+        thinking = ""
+        tool_calls = []
+        metadata = None
+
+        async for chunk in response:
+            if (
+                chunk.candidates
+                and chunk.candidates[0].content
+                and chunk.candidates[0].content.parts
+            ):
+                for part in chunk.candidates[0].content.parts:
+                    if part.text:
+                        if part.thought:
+                            thinking += part.text
+                        else:
+                            text += part.text
+
+                    if part.function_call:
+                        keyword_args = part.function_call.args or {}
+
+                        if part.thought_signature:
+                            call_id = _base64.b64encode(
+                                part.thought_signature,
+                            ).decode("utf-8")
+                        else:
+                            call_id = part.function_call.id
+
+                        tool_calls.append(
+                            ToolUseBlock(
+                                type="tool_use",
+                                id=call_id,
+                                name=part.function_call.name,
+                                input=keyword_args,
+                                raw_input=json.dumps(
+                                    keyword_args,
+                                    ensure_ascii=False,
+                                ),
+                            ),
+                        )
+
+            if text and structured_model:
+                metadata = _json_loads_with_repair(text)
+
+            usage = None
+            if chunk.usage_metadata:
+                prompt_tokens = chunk.usage_metadata.prompt_token_count or 0
+                total_tokens = chunk.usage_metadata.total_token_count or 0
+                output_tokens = max(0, total_tokens - prompt_tokens)
+
+                usage = ChatUsage(
+                    input_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                    time=(datetime.now() - start_datetime).total_seconds(),
+                )
+
+            content_blocks = []
+            if thinking:
+                content_blocks.append(
+                    ThinkingBlock(
+                        type="thinking",
+                        thinking=thinking,
+                    ),
+                )
+
+            if text:
+                content_blocks.append(
+                    TextBlock(
+                        type="text",
+                        text=text,
+                    ),
+                )
+
+            yield ChatResponse(
+                content=content_blocks + tool_calls,
+                usage=usage,
+                metadata=metadata,
+            )
+
+    _patched_parse_gemini_stream_generation_response._agentscope_research_patched = True
+    GeminiChatModel._parse_gemini_stream_generation_response = (
+        _patched_parse_gemini_stream_generation_response
+    )
+
+
 # Apply patches
-fix_agentscope_gemini.apply_patch()
+_patch_google_genai_client_close()
+_patch_agentscope_gemini_stream_usage()
 fix_gemini_thinking_formatter.apply_patch()
 
 # Initialize Langfuse client
@@ -107,6 +264,11 @@ def _create_lancedb_vector_store(uri: str, table_name: str, embedding_model):
 @observe()
 async def creating_react_agent() -> None:
     """创建一个 ReAct 智能体并运行一个简单任务。"""
+    warnings.filterwarnings(
+        "ignore",
+        category=DeprecationWarning,
+        message=r"Inheritance class AiohttpClientSession from ClientSession is discouraged",
+    )
     # Get Prompt from Langfuse
     print("Fetching prompt from Langfuse...")
     try:
@@ -181,13 +343,64 @@ async def creating_react_agent() -> None:
         long_term_memory_mode="agent_control",
     )
 
-    msg = Msg(
-        name="user",
-        content="告诉我你有哪些工具和技能？",
-        role="user",
-    )
+    print("已启动交互模式：直接输入文本发送；发送图片：/img <path> [可选描述]；退出：/exit")
+    while True:
+        raw = await asyncio.to_thread(input, "You> ")
+        if raw is None:
+            continue
 
-    await aime(msg)
+        user_input = raw.strip()
+        if not user_input:
+            continue
+
+        if user_input.lower() in {"exit", "quit", "/exit", "/quit"}:
+            break
+
+        if user_input.startswith("/img "):
+            parts = user_input.split(maxsplit=2)
+            if len(parts) < 2:
+                print("Error: missing image path")
+                continue
+
+            image_path = os.path.expanduser(parts[1])
+            caption = parts[2] if len(parts) >= 3 else ""
+
+            try:
+                data = Path(image_path).read_bytes()
+            except FileNotFoundError:
+                print(f"Error: image file not found: {image_path}")
+                continue
+            except Exception as e:
+                print(f"Error: failed to read image: {e}")
+                continue
+
+            mime, _ = mimetypes.guess_type(image_path)
+            media_type = mime or "image/jpeg"
+            b64 = base64.b64encode(data).decode("utf-8")
+
+            blocks = []
+            if caption:
+                blocks.append(TextBlock(type="text", text=caption))
+            blocks.append(
+                ImageBlock(
+                    type="image",
+                    source=Base64Source(
+                        type="base64",
+                        media_type=media_type,
+                        data=b64,
+                    ),
+                ),
+            )
+
+            msg = Msg(name="user", role="user", content=blocks)
+        else:
+            msg = Msg(name="user", role="user", content=user_input)
+
+        try:
+            warnings.simplefilter("ignore", DeprecationWarning)
+            await aime(msg)
+        except Exception as e:
+            print(f"Error: {e}")
 
 
 if __name__ == "__main__":
