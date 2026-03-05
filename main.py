@@ -175,9 +175,134 @@ def _patch_agentscope_gemini_stream_usage() -> None:
     )
 
 
+def _patch_agentscope_gemini_embedding_batch_fallback() -> None:
+    from datetime import datetime
+
+    from agentscope.embedding import GeminiTextEmbedding
+    from agentscope.embedding._embedding_response import EmbeddingResponse
+    from agentscope.embedding._embedding_usage import EmbeddingUsage
+
+    if getattr(GeminiTextEmbedding.__call__, "_agentscope_research_patched", False):
+        return
+
+    original_call = GeminiTextEmbedding.__call__
+
+    async def _patched_call(self, text, **kwargs):
+        gather_text = []
+        for _ in text:
+            if isinstance(_, dict) and "text" in _:
+                gather_text.append(_["text"])
+            elif isinstance(_, str):
+                gather_text.append(_)
+            else:
+                raise ValueError(
+                    "Input text must be a list of strings or TextBlock dicts.",
+                )
+
+        request_identifier = {
+            "model": self.model_name,
+            "contents": gather_text[0] if len(gather_text) == 1 else gather_text,
+            "config": kwargs,
+        }
+
+        if self.embedding_cache:
+            cached_embeddings = await self.embedding_cache.retrieve(
+                identifier=request_identifier,
+            )
+            if cached_embeddings:
+                return EmbeddingResponse(
+                    embeddings=cached_embeddings,
+                    usage=EmbeddingUsage(
+                        tokens=0,
+                        time=0,
+                    ),
+                    source="cache",
+                )
+
+        start_time = datetime.now()
+
+        def _extract_embeddings(resp):
+            return [_.values for _ in resp.embeddings]
+
+        enable_batch = os.environ.get("GEMINI_ENABLE_BATCH_EMBED", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+        if len(gather_text) == 1:
+            response = self.client.models.embed_content(
+                model=self.model_name,
+                contents=gather_text[0],
+                config=kwargs,
+            )
+            embeddings = _extract_embeddings(response)
+        elif not enable_batch:
+            embeddings = []
+            for item in gather_text:
+                resp = self.client.models.embed_content(
+                    model=self.model_name,
+                    contents=item,
+                    config=kwargs,
+                )
+                item_embeddings = _extract_embeddings(resp)
+                if not item_embeddings:
+                    raise RuntimeError("Empty embedding response")
+                embeddings.append(item_embeddings[0])
+        else:
+            try:
+                response = self.client.models.embed_content(
+                    model=self.model_name,
+                    contents=gather_text,
+                    config=kwargs,
+                )
+                embeddings = _extract_embeddings(response)
+            except Exception as e:
+                err_text = str(e)
+                if (
+                    "batchEmbedContents" in err_text
+                    or "Unsupported action" in err_text
+                    or "404" in err_text
+                    or "NOT_FOUND" in err_text
+                ):
+                    embeddings = []
+                    for item in gather_text:
+                        resp = self.client.models.embed_content(
+                            model=self.model_name,
+                            contents=item,
+                            config=kwargs,
+                        )
+                        item_embeddings = _extract_embeddings(resp)
+                        if not item_embeddings:
+                            raise RuntimeError("Empty embedding response")
+                        embeddings.append(item_embeddings[0])
+                else:
+                    raise
+
+        time = (datetime.now() - start_time).total_seconds()
+
+        if self.embedding_cache:
+            await self.embedding_cache.store(
+                identifier=request_identifier,
+                embeddings=embeddings,
+            )
+
+        return EmbeddingResponse(
+            embeddings=embeddings,
+            usage=EmbeddingUsage(
+                time=time,
+            ),
+        )
+
+    _patched_call._agentscope_research_patched = True
+    GeminiTextEmbedding.__call__ = _patched_call
+    GeminiTextEmbedding.__call__._agentscope_research_original = original_call
+
+
 # Apply patches
 _patch_google_genai_client_close()
 _patch_agentscope_gemini_stream_usage()
+_patch_agentscope_gemini_embedding_batch_fallback()
 fix_gemini_thinking_formatter.apply_patch()
 
 # Initialize Langfuse client
@@ -188,9 +313,56 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+async def _probe_embedding_dim(embedding_model) -> int | None:
+    try:
+        resp = await embedding_model(["dimension_probe"])
+        embeddings = getattr(resp, "embeddings", None)
+        if not embeddings:
+            return None
+        first = embeddings[0]
+        if not first:
+            return None
+        return len(first)
+    except Exception:
+        return None
+
+
+def _get_existing_lancedb_vector_dim(uri: str, table_name: str) -> int | None:
+    try:
+        import lancedb
+
+        db = lancedb.connect(uri)
+        list_tables = getattr(db, "list_tables", None)
+        table_names = list_tables() if callable(list_tables) else db.table_names()
+        if table_name not in set(table_names):
+            return None
+        tbl = db.open_table(table_name)
+        schema = tbl.schema
+        if "vector" not in schema.names:
+            return None
+        vec_type = schema.field("vector").type
+        if hasattr(vec_type, "list_size"):
+            return int(vec_type.list_size)
+        return None
+    except Exception:
+        return None
+
+
+def _resolve_lancedb_table_name(
+    *, uri: str, table_name: str, embedding_dim: int | None
+) -> str:
+    if embedding_dim is None:
+        return table_name
+    existing_dim = _get_existing_lancedb_vector_dim(uri, table_name)
+    if existing_dim is None or existing_dim == embedding_dim:
+        return table_name
+    return f"{table_name}_d{embedding_dim}"
+
+
 def _create_lancedb_vector_store(uri: str, table_name: str, embedding_model):
     from langchain_community.vectorstores import LanceDB as _LanceDB
     from langchain_core.embeddings import Embeddings as _Embeddings
+    from langchain_core.documents import Document as _Document
 
     class _AgentscopeEmbeddingsAdapter(_Embeddings):
         def __init__(self, model):
@@ -223,14 +395,47 @@ def _create_lancedb_vector_store(uri: str, table_name: str, embedding_model):
             return resp.embeddings[0]
 
     class LanceDBPrecomputedEmbeddings(_LanceDB):
+        @staticmethod
+        def _quote_lance_sql_value(value):
+            if value is None:
+                return "NULL"
+            if isinstance(value, bool):
+                return "true" if value else "false"
+            if isinstance(value, (int, float)):
+                return str(value)
+            text = str(value).replace("\\", "\\\\").replace("'", "\\'")
+            return f"'{text}'"
+
+        @classmethod
+        def _to_lance_where(cls, filter_dict: dict) -> str:
+            parts: list[str] = []
+            for key, value in filter_dict.items():
+                if key.startswith("$"):
+                    raise ValueError(f"Unsupported filter operator: {key}")
+                parts.append(f"metadata.{key} = {cls._quote_lance_sql_value(value)}")
+            return " AND ".join(parts)
+
         def add_embeddings(self, embeddings, metadatas=None, ids=None):
             ids = ids or [str(uuid.uuid4()) for _ in embeddings]
             docs = []
+            tbl = self.get_table()
+            metadata_allowed_keys = None
+            if tbl is not None and "metadata" in tbl.schema.names:
+                try:
+                    meta_field = tbl.schema.field("metadata")
+                    meta_type = meta_field.type
+                    if hasattr(meta_type, "names") and meta_type.names:
+                        metadata_allowed_keys = set(meta_type.names)
+                except Exception:
+                    metadata_allowed_keys = None
+
             for idx, embedding in enumerate(embeddings):
                 metadata = metadatas[idx] if metadatas else {"id": ids[idx]}
                 text = ""
                 if isinstance(metadata, dict):
                     text = str(metadata.get("data", ""))
+                    if metadata_allowed_keys is not None:
+                        metadata = {k: v for k, v in metadata.items() if k in metadata_allowed_keys}
                 docs.append(
                     {
                         self._vector_key: embedding,
@@ -240,7 +445,6 @@ def _create_lancedb_vector_store(uri: str, table_name: str, embedding_model):
                     },
                 )
 
-            tbl = self.get_table()
             if tbl is None:
                 tbl = self._connection.create_table(self._table_name, data=docs)
                 self._table = tbl
@@ -252,6 +456,58 @@ def _create_lancedb_vector_store(uri: str, table_name: str, embedding_model):
 
             self._fts_index = None
             return ids
+
+        def similarity_search_by_vector(
+            self,
+            embedding,
+            k: int | None = None,
+            filter: dict | str | None = None,
+            name: str | None = None,
+            **kwargs,
+        ):
+            if isinstance(embedding, list) and embedding and isinstance(
+                embedding[0],
+                (list, tuple),
+            ):
+                embedding = embedding[0]
+
+            where = None
+            if isinstance(filter, dict):
+                where = self._to_lance_where(filter)
+            else:
+                where = filter
+
+            docs = self._query(embedding, k, filter=where, name=name, **kwargs)
+            ids = []
+            scores = []
+            metadatas = []
+
+            relevance_score_fn = self._select_relevance_score_fn()
+            distance_col = "_distance" if "_distance" in docs.schema.names else None
+
+            for idx in range(len(docs)):
+                ids.append(docs[self._id_key][idx].as_py())
+                metadatas.append(docs["metadata"][idx].as_py() if "metadata" in docs.schema.names else {})
+                if distance_col is not None:
+                    scores.append(relevance_score_fn(float(docs[distance_col][idx].as_py())))
+                else:
+                    scores.append(None)
+
+            return {"ids": [ids], "distances": [scores], "metadatas": [metadatas]}
+
+        def get_by_ids(self, ids: list[str], name: str | None = None):
+            if not ids:
+                return []
+            tbl = self.get_table(name)
+            quoted = ",".join(self._quote_lance_sql_value(i) for i in ids)
+            rows = tbl.search().where(f"{self._id_key} in ({quoted})").to_arrow()
+            docs = []
+            for idx in range(len(rows)):
+                page_content = rows[self._text_key][idx].as_py()
+                metadata = rows["metadata"][idx].as_py() if "metadata" in rows.schema.names else {}
+                doc_id = rows[self._id_key][idx].as_py()
+                docs.append(_Document(page_content=page_content, metadata=metadata, id=doc_id))
+            return docs
 
     return LanceDBPrecomputedEmbeddings(
         uri=uri,
@@ -278,6 +534,18 @@ async def creating_react_agent() -> None:
     except Exception as e:
         print(f"Error loading prompt from Langfuse: {e}")
         sys_prompt_content = "你是一个名为 Aime 的助手"
+
+    if (
+        "record_to_memory" not in sys_prompt_content
+        and "retrieve_from_memory" not in sys_prompt_content
+    ):
+        sys_prompt_content = (
+            sys_prompt_content
+            + "\n\n## 记忆管理指南：\n"
+            "1. 当用户分享个人信息、偏好、习惯或可复用事实时，使用 record_to_memory 记录。\n"
+            "2. 在回答涉及用户过往信息/偏好/事实的问题前，先使用 retrieve_from_memory 检索。\n"
+            "3. keywords 使用短、明确的短语（如地点、人名、主题、日期）。"
+        )
 
     project_root = _project_root()
 
@@ -307,6 +575,27 @@ async def creating_react_agent() -> None:
 
     lancedb_uri = os.environ.get("LANCEDB_URI", str(Path("~/.lancedb").expanduser()))
     lancedb_table = os.environ.get("LANCEDB_TABLE_NAME", "mem0_memory")
+
+    embedding_dim = None
+    embedding_dim_env = os.environ.get("GEMINI_EMBEDDING_DIMS") or os.environ.get(
+        "EMBEDDING_DIMS",
+    )
+    if embedding_dim_env:
+        try:
+            embedding_dim = int(embedding_dim_env)
+        except ValueError:
+            embedding_dim = None
+    if embedding_dim is None:
+        embedding_dim = await _probe_embedding_dim(embedding_model)
+    lancedb_table = _resolve_lancedb_table_name(
+        uri=lancedb_uri,
+        table_name=lancedb_table,
+        embedding_dim=embedding_dim,
+    )
+    effective_embedding_dim = embedding_dim or _get_existing_lancedb_vector_dim(
+        lancedb_uri,
+        lancedb_table,
+    )
     lancedb_vs = _create_lancedb_vector_store(
         uri=lancedb_uri,
         table_name=lancedb_table,
@@ -315,10 +604,18 @@ async def creating_react_agent() -> None:
 
     import mem0
 
+    try:
+        from mem0.vector_stores.langchain import Langchain as _Mem0LangchainVectorStore
+
+        if effective_embedding_dim is not None:
+            _Mem0LangchainVectorStore.embedding_model_dims = effective_embedding_dim
+    except Exception:
+        pass
     vector_store_config = mem0.vector_stores.configs.VectorStoreConfig(
         provider="langchain",
         config={"client": lancedb_vs, "collection_name": "mem0"},
     )
+
 
     long_term_memory = Mem0LongTermMemory(
         agent_name="Aime",
