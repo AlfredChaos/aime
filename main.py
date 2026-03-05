@@ -31,8 +31,39 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parent
 
 
-def _create_lancedb_vector_store(uri: str, table_name: str):
+def _create_lancedb_vector_store(uri: str, table_name: str, embedding_model):
     from langchain_community.vectorstores import LanceDB as _LanceDB
+    from langchain_core.embeddings import Embeddings as _Embeddings
+
+    class _AgentscopeEmbeddingsAdapter(_Embeddings):
+        def __init__(self, model):
+            self._model = model
+
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                resp = asyncio.run(self._model(texts))
+                return resp.embeddings
+
+            import concurrent.futures
+
+            def _run():
+                return asyncio.run(self._model(texts))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                return executor.submit(_run).result().embeddings
+
+        def embed_query(self, text: str) -> list[float]:
+            return self.embed_documents([text])[0]
+
+        async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+            resp = await self._model(texts)
+            return resp.embeddings
+
+        async def aembed_query(self, text: str) -> list[float]:
+            resp = await self._model([text])
+            return resp.embeddings[0]
 
     class LanceDBPrecomputedEmbeddings(_LanceDB):
         def add_embeddings(self, embeddings, metadatas=None, ids=None):
@@ -65,7 +96,12 @@ def _create_lancedb_vector_store(uri: str, table_name: str):
             self._fts_index = None
             return ids
 
-    return LanceDBPrecomputedEmbeddings(uri=uri, table_name=table_name, embedding=None, mode="append")
+    return LanceDBPrecomputedEmbeddings(
+        uri=uri,
+        table_name=table_name,
+        embedding=_AgentscopeEmbeddingsAdapter(embedding_model),
+        mode="append",
+    )
 
 
 @observe()
@@ -109,7 +145,11 @@ async def creating_react_agent() -> None:
 
     lancedb_uri = os.environ.get("LANCEDB_URI", str(Path("~/.lancedb").expanduser()))
     lancedb_table = os.environ.get("LANCEDB_TABLE_NAME", "mem0_memory")
-    lancedb_vs = _create_lancedb_vector_store(uri=lancedb_uri, table_name=lancedb_table)
+    lancedb_vs = _create_lancedb_vector_store(
+        uri=lancedb_uri,
+        table_name=lancedb_table,
+        embedding_model=embedding_model,
+    )
 
     import mem0
 
@@ -143,7 +183,7 @@ async def creating_react_agent() -> None:
 
     msg = Msg(
         name="user",
-        content="介绍一下你自己。如果让你自己设定自己的性格爱好，你会怎么做？",
+        content="告诉我你有哪些工具和技能？",
         role="user",
     )
 
