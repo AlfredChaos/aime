@@ -5,6 +5,33 @@ import uuid
 from datetime import datetime
 
 
+def _get_lancedb_table_names(db) -> list[str]:
+    list_tables = getattr(db, "list_tables", None)
+    if callable(list_tables):
+        result = list_tables()
+        tables = getattr(result, "tables", None)
+        if isinstance(tables, list) and all(isinstance(x, str) for x in tables):
+            return tables
+        if isinstance(result, dict):
+            tables = result.get("tables")
+            if isinstance(tables, list) and all(isinstance(x, str) for x in tables):
+                return tables
+        try:
+            as_dict = dict(result)
+            tables = as_dict.get("tables")
+            if isinstance(tables, list) and all(isinstance(x, str) for x in tables):
+                return tables
+        except Exception:
+            pass
+
+    table_names = getattr(db, "table_names", None)
+    if callable(table_names):
+        result = table_names()
+        if isinstance(result, list) and all(isinstance(x, str) for x in result):
+            return result
+    return []
+
+
 async def probe_embedding_dim(embedding_model) -> int | None:
     try:
         resp = await embedding_model(["dimension_probe"])
@@ -24,9 +51,7 @@ def get_existing_lancedb_vector_dim(uri: str, table_name: str) -> int | None:
         import lancedb
 
         db = lancedb.connect(uri)
-        list_tables = getattr(db, "list_tables", None)
-        table_names = list_tables() if callable(list_tables) else db.table_names()
-        if table_name not in set(table_names):
+        if table_name not in set(_get_lancedb_table_names(db)):
             return None
         tbl = db.open_table(table_name)
         schema = tbl.schema
@@ -47,6 +72,121 @@ def resolve_lancedb_table_name(*, uri: str, table_name: str, embedding_dim: int 
     if existing_dim is None or existing_dim == embedding_dim:
         return table_name
     return f"{table_name}_d{embedding_dim}"
+
+
+def ensure_lancedb_table_exists(
+    *,
+    uri: str,
+    table_name: str,
+    embedding_dim: int,
+    template_table_name: str | None = None,
+) -> None:
+    import lancedb
+    import pyarrow as pa
+
+    db = lancedb.connect(uri)
+    existing = set(_get_lancedb_table_names(db))
+    if table_name in existing:
+        return
+
+    schema = None
+    if template_table_name and template_table_name in existing:
+        tmpl = db.open_table(template_table_name).schema
+        fields: list[pa.Field] = []
+        for field in tmpl:
+            if field.name == "vector":
+                fields.append(
+                    pa.field(
+                        "vector",
+                        pa.list_(pa.float32(), list_size=embedding_dim),
+                    ),
+                )
+            else:
+                fields.append(field)
+        schema = pa.schema(fields)
+
+    if schema is None:
+        schema = pa.schema(
+            [
+                pa.field("vector", pa.list_(pa.float32(), list_size=embedding_dim)),
+                pa.field("id", pa.string()),
+                pa.field("text", pa.string()),
+                pa.field(
+                    "metadata",
+                    pa.struct(
+                        [
+                            pa.field("type", pa.string()),
+                            pa.field("user_id", pa.string()),
+                            pa.field("agent_id", pa.string()),
+                        ],
+                    ),
+                ),
+            ],
+        )
+
+    db.create_table(table_name, schema=schema, data=[])
+
+
+async def migrate_lancedb_table_embeddings(
+    *,
+    uri: str,
+    source_table_name: str,
+    target_table_name: str,
+    embedding_model,
+    batch_size: int = 64,
+) -> int:
+    import lancedb
+
+    db = lancedb.connect(uri)
+    source = db.open_table(source_table_name)
+    target = db.open_table(target_table_name)
+
+    try:
+        existing_rows = int(target.count_rows())
+    except Exception:
+        existing_rows = 0
+    if existing_rows > 0:
+        return 0
+
+    rows = source.to_arrow().to_pydict()
+    ids: list[str] = rows.get("id") or []
+    texts: list[str] = rows.get("text") or []
+    metadatas: list[dict] = rows.get("metadata") or []
+
+    to_migrate: list[tuple[str, str, dict]] = []
+    for i in range(min(len(ids), len(texts), len(metadatas))):
+        text = texts[i]
+        if not text:
+            meta = metadatas[i] if isinstance(metadatas[i], dict) else {}
+            candidate = meta.get("data") if isinstance(meta, dict) else None
+            text = str(candidate) if candidate else ""
+        if not text:
+            continue
+        meta = metadatas[i] if isinstance(metadatas[i], dict) else {}
+        to_migrate.append((ids[i], text, meta))
+
+    inserted = 0
+    for start in range(0, len(to_migrate), batch_size):
+        batch = to_migrate[start : start + batch_size]
+        resp = await embedding_model([t for _, t, _ in batch])
+        embeddings = getattr(resp, "embeddings", None) or []
+        if len(embeddings) != len(batch):
+            raise RuntimeError(
+                "Embedding batch size mismatch while migrating LanceDB table",
+            )
+        docs = []
+        for (doc_id, text, meta), vec in zip(batch, embeddings):
+            docs.append(
+                {
+                    "vector": vec,
+                    "id": doc_id,
+                    "text": text,
+                    "metadata": meta,
+                },
+            )
+        target.add(docs)
+        inserted += len(docs)
+    return inserted
 
 
 def create_lancedb_vector_store(uri: str, table_name: str, embedding_model):
@@ -222,4 +362,3 @@ def create_vector_store_config(*, lancedb_vs, effective_embedding_dim: int | Non
         provider="langchain",
         config={"client": lancedb_vs, "collection_name": "mem0"},
     )
-

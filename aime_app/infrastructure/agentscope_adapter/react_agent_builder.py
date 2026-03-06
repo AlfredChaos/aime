@@ -19,8 +19,10 @@ from aime_app.infrastructure.vectorstores.lancedb_store import (
     create_lancedb_vector_store,
     create_vector_store_config,
     get_existing_lancedb_vector_dim,
+    migrate_lancedb_table_embeddings,
     probe_embedding_dim,
     resolve_lancedb_table_name,
+    ensure_lancedb_table_exists,
 )
 
 
@@ -59,8 +61,10 @@ class ReActAgentBuilder(AgentBuilder):
         lancedb_table = os.environ.get("LANCEDB_TABLE_NAME", "mem0_memory")
 
         embedding_dim = None
-        embedding_dim_env = os.environ.get("GEMINI_EMBEDDING_DIMS") or os.environ.get(
-            "EMBEDDING_DIMS",
+        embedding_dim_env = (
+            os.environ.get("SILICONFLOW_EMBEDDING_DIMS")
+            or os.environ.get("GEMINI_EMBEDDING_DIMS")
+            or os.environ.get("EMBEDDING_DIMS")
         )
         if embedding_dim_env:
             try:
@@ -68,14 +72,36 @@ class ReActAgentBuilder(AgentBuilder):
             except ValueError:
                 embedding_dim = None
 
-        if embedding_dim is None:
-            embedding_dim = await probe_embedding_dim(embedding_model)
+        probed_dim = await probe_embedding_dim(embedding_model)
+        if probed_dim is not None:
+            embedding_dim = probed_dim
 
+        base_lancedb_table = lancedb_table
         lancedb_table = resolve_lancedb_table_name(
             uri=lancedb_uri,
             table_name=lancedb_table,
             embedding_dim=embedding_dim,
         )
+
+        if embedding_dim is not None:
+            ensure_lancedb_table_exists(
+                uri=lancedb_uri,
+                table_name=lancedb_table,
+                embedding_dim=embedding_dim,
+                template_table_name=base_lancedb_table,
+            )
+            base_dim = get_existing_lancedb_vector_dim(lancedb_uri, base_lancedb_table)
+            if (
+                base_dim is not None
+                and base_dim != embedding_dim
+                and base_lancedb_table != lancedb_table
+            ):
+                await migrate_lancedb_table_embeddings(
+                    uri=lancedb_uri,
+                    source_table_name=base_lancedb_table,
+                    target_table_name=lancedb_table,
+                    embedding_model=embedding_model,
+                )
 
         effective_embedding_dim = embedding_dim or get_existing_lancedb_vector_dim(
             lancedb_uri,
@@ -116,4 +142,3 @@ class ReActAgentBuilder(AgentBuilder):
         )
 
         return agent
-
