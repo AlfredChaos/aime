@@ -1,24 +1,3 @@
-"""
-[Input] 运行目录下的 tools/ 与 skills/，以及 agentscope.tool.Toolkit 实例。
-[Output] 提供 create_toolkit()，自动加载工具与技能，并注册“技能按需读取”工具函数。
-[Pos] Agent 启动引导层：把“目录化扩展（tools/skills）”打通到 AgentScope 的 Toolkit。
-
-关于“渐进式披露（Progressive Disclosure）”
-------------------------------------------
-目标：让智能体在不把所有能力细节一次性塞进 Prompt 的前提下，仍能“发现并按需获取”能力说明。
-
-在本项目里，“渐进式披露”分两层：
-1) 启动时披露“目录级索引（Index）”
-   - 仅把每个 Skill 的 name/description/目录路径加入系统提示词（SKILL.md 的 YAML front matter + 简要正文）。
-   - 这样模型知道“有哪些技能存在、它们大致用于什么”，但不会把技能的全部实现细节一次性灌入上下文。
-
-2) 运行时披露“内容级细节（Details on demand）”
-   - 通过工具 read_skill_markdown / read_skill_file，让模型在需要时再读取具体技能文件内容。
-   - 这把信息获取从“推送（push）”改为“拉取（pull）”，降低 token 溢出与注意力分散。
-
-这套机制的核心是：让模型先获得“可检索的目录索引”，再用工具按需读取局部细节。
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -137,3 +116,4 @@ def create_toolkit(project_root: str | None = None) -> Toolkit:
     discover_and_register_skills(toolkit, skills_dir)
 
     return toolkit
+
